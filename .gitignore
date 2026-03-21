@@ -38,3 +38,4 @@ metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
 
 expert_index_35b.json
+model_manager.py
