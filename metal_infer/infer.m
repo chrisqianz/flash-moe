@@ -426,6 +426,7 @@ typedef struct {
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
+static int g_serve_mode = 0;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -1576,6 +1577,18 @@ static void gpu_dequant_matvec(
     const float *x_f32, float *out_f32,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
+    // For tiny matmuls, CPU wins because Metal dispatch + synchronization overhead
+    // is larger than the compute itself. This especially helps TTFT during prefill.
+    uint64_t work_items = (uint64_t)out_dim * (uint64_t)in_dim;
+    if (work_items <= 262144ULL || !ctx->wf_buf) {
+        cpu_dequant_matvec((const uint32_t *)W_packed,
+                           (const uint16_t *)scales,
+                           (const uint16_t *)biases,
+                           x_f32, out_f32,
+                           (int)out_dim, (int)in_dim, (int)group_size);
+        return;
+    }
+
     // Copy input to Metal buffer
     memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
 
@@ -1595,21 +1608,20 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
-    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
-    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
-    int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-    [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-    [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-    [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-    [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-    [enc setBuffer:o_buf        offset:0     atIndex:4];
-    [enc setBytes:&out_dim      length:4     atIndex:5];
-    [enc setBytes:&in_dim       length:4     atIndex:6];
-    [enc setBytes:&group_size   length:4     atIndex:7];
+    // Prefer the LUT dequant kernel for <=4096 input dims; fall back to fast kernel for larger inputs.
+    int use_lut = (in_dim <= 4096 && ctx->matvec_v5 != nil);
+    [enc setComputePipelineState: use_lut ? ctx->matvec_v5 : ctx->matvec_fast];
+    [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+    [enc setBuffer:ctx->wf_buf    offset:s_off atIndex:1];
+    [enc setBuffer:ctx->wf_buf    offset:b_off atIndex:2];
+    [enc setBuffer:ctx->buf_input offset:0     atIndex:3];
+    [enc setBuffer:o_buf          offset:0     atIndex:4];
+    [enc setBytes:&out_dim        length:4     atIndex:5];
+    [enc setBytes:&in_dim         length:4     atIndex:6];
+    [enc setBytes:&group_size     length:4     atIndex:7];
 
-    if (use_v3) {
-        // v3: tiled threadgroups, 256 threads, 8 rows per TG
+    if (use_lut) {
+        // v5: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1623,6 +1635,17 @@ static void gpu_dequant_matvec(
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
 
+    if (cmdbuf.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "ERROR: gpu_dequant_matvec command buffer failed: %s\n",
+            cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "unknown Metal error");
+        cpu_dequant_matvec((const uint32_t *)W_packed,
+            (const uint16_t *)scales,
+            (const uint16_t *)biases,
+            x_f32, out_f32,
+            (int)out_dim, (int)in_dim, (int)group_size);
+        return;
+    }
+    
     // Copy result back
     memcpy(out_f32, [o_buf contents], o_size);
 }
@@ -1633,7 +1656,8 @@ static void fast_dequant_matvec(
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    uint64_t work_items = (uint64_t)out_dim * (uint64_t)in_dim;
+    if (g_metal && g_metal->wf_buf && work_items > 262144ULL) {
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
@@ -1678,8 +1702,8 @@ static void gpu_batch_matvec(
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
+        [enc setComputePipelineState: use_lut ? ctx->matvec_v5 : ctx->matvec_fast];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -1689,7 +1713,7 @@ static void gpu_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_v3) {
+        if (use_lut) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1702,6 +1726,20 @@ static void gpu_batch_matvec(
 
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
+
+    if (cmdbuf.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "ERROR: gpu_batch_matvec command buffer failed: %s\n",
+                cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "unknown Metal error");
+        for (int i = 0; i < num_specs; i++) {
+            BatchMatvecSpec *s = &specs[i];
+            cpu_dequant_matvec((const uint32_t *)s->W,
+                               (const uint16_t *)s->scales,
+                               (const uint16_t *)s->biases,
+                               x_f32, s->out_cpu,
+                               (int)s->out_dim, (int)s->in_dim, (int)s->group_size);
+        }
+        return;
+    }
 
     // Copy results back to CPU
     for (int i = 0; i < num_specs; i++) {
@@ -1732,8 +1770,8 @@ static void gpu_encode_batch_matvec(
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        int use_lut = (s->in_dim <= 4096 && ctx->matvec_v5 != nil);
+        [enc setComputePipelineState: use_lut ? ctx->matvec_v5 : ctx->matvec_fast];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
         [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
@@ -1743,7 +1781,7 @@ static void gpu_encode_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_v3) {
+        if (use_lut) {
             uint32_t num_tgs = (s->out_dim + 7) / 8;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2187,7 +2225,18 @@ static void fast_batch_matvec(
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    int use_gpu = (g_metal && g_metal->wf_buf);
+    if (use_gpu) {
+        for (int i = 0; i < num_specs; i++) {
+            uint64_t work_items = (uint64_t)specs[i].out_dim * (uint64_t)specs[i].in_dim;
+            if (work_items <= 262144ULL) {
+                use_gpu = 0;
+                break;
+            }
+        }
+    }
+
+    if (use_gpu) {
         gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
     } else {
         for (int i = 0; i < num_specs; i++) {
@@ -6139,12 +6188,47 @@ static int sse_send_delta(int fd, const char *request_id, const char *token_text
         }
     }
     *w = '\0';
+
     int n = snprintf(chunk, sizeof(chunk),
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
         request_id, escaped);
-    ssize_t wr = write(fd, chunk, n);
-    return (wr <= 0) ? -1 : 0;
+
+    int sent = 0;
+    while (sent < n) {
+        ssize_t wr = write(fd, chunk + sent, n - sent);
+        if (wr <= 0) return -1;
+        sent += (int)wr;
+    }
+    return 0;
+}
+
+static int sse_send_role(int fd, const char *request_id) {
+    char chunk[1024];
+    int n = snprintf(chunk, sizeof(chunk),
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        request_id);
+
+    int sent = 0;
+    while (sent < n) {
+        ssize_t wr = write(fd, chunk + sent, n - sent);
+        if (wr <= 0) return -1;
+        sent += (int)wr;
+    }
+    return 0;
+}
+
+static int sse_send_keepalive(int fd) {
+    const char *ka = ": keep-alive\n\n";
+    int len = (int)strlen(ka);
+    int sent = 0;
+    while (sent < len) {
+        ssize_t wr = write(fd, ka + sent, len - sent);
+        if (wr <= 0) return -1;
+        sent += (int)wr;
+    }
+    return 0;
 }
 
 static void sse_send_done(int fd, const char *request_id) {
@@ -6154,7 +6238,13 @@ static void sse_send_done(int fd, const char *request_id) {
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
         "data: [DONE]\n\n",
         request_id);
-    http_write(fd, chunk, n);
+
+    int sent = 0;
+    while (sent < n) {
+        ssize_t wr = write(fd, chunk + sent, n - sent);
+        if (wr <= 0) break;
+        sent += (int)wr;
+    }
 }
 
 static const char *SSE_HEADERS =
@@ -6626,6 +6716,9 @@ static void serve_loop(
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
 
+            if (sse_send_role(client_fd, request_id) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
+            if (sse_send_keepalive(client_fd) < 0) { free(pt->ids); free(pt); free(reqbuf); close(client_fd); continue; }
+
             // ---- Batch prefill ----
             double t_prefill = now_ms();
             // Pre-embed all request tokens
@@ -6702,10 +6795,13 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
+            int client_alive = 1;
+
             // Accumulate response for session persistence
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
+            // Stream first token immediately after first logits are ready
             for (int gen = 0; gen < max_gen; gen++) {
                 if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
                     // Feed EOS through the model so session state includes it
@@ -6731,26 +6827,32 @@ static void serve_loop(
                 if (in_think) {
                     think_tokens++;
                     if (g_think_budget > 0 && think_tokens >= g_think_budget) {
-                        next_token = cfg.think_end_token;  // force end thinking
+                        next_token = cfg.think_end_token;
                         in_think = 0;
                     }
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
+
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256 * 1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+
+                if (tok_str && tok_str[0]) {
+                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                        client_alive = 0;
+                        break;
+                    }
                 }
+
                 gen_count++;
 
-                // Generate next
+                // Generate next token
                 cache_telemetry_note_token();
                 embed_lookup(wf, next_token, hidden);
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
@@ -6771,11 +6873,23 @@ static void serve_loop(
                     memcpy(hidden, normed, cfg.hidden_dim * sizeof(float));
                     free(normed);
                 }
+
                 lm_head_forward(wf, hidden, logits);
                 next_token = cpu_argmax(logits, cfg.vocab_size);
+
+                // Optional light keepalive every 32 tokens
+                if ((gen_count & 31) == 0) {
+                    if (sse_send_keepalive(client_fd) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected during keepalive\n", request_id);
+                        client_alive = 0;
+                        break;
+                    }
+                }
             }
 
-            sse_send_done(client_fd, request_id);
+            if (client_alive) {
+                sse_send_done(client_fd, request_id);
+            }
 
             // ---- Save session state ----
             free(gen_response);
@@ -6918,6 +7032,8 @@ int main(int argc, char **argv) {
                 default:  print_usage(argv[0]); return 1;
             }
         }
+
+        g_serve_mode = (serve_port > 0);
 
         // ---- Load model configuration from HF config.json ----
         load_model_config(model_path ? model_path : "");
@@ -7444,8 +7560,10 @@ int main(int argc, char **argv) {
             double tok_time = t_gen_end - t_gen_start;
 
             // Print progress to stderr
-            fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
+            if (!g_serve_mode) {
+                fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
                     gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
+            }
         }
 
         if (g_timing_enabled) timing_print();
