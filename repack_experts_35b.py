@@ -2,8 +2,8 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Each file = 256 experts x 1,769,472 bytes = ~432 MB
+Expert E starts at byte offset E * 1,769,472
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -11,11 +11,11 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight,  down_proj.scales,  down_proj.biases
 
 Usage:
-    python repack_experts.py                    # repack all 60 layers
-    python repack_experts.py --layers 0-4       # repack layers 0-4
-    python repack_experts.py --layers 0,5,10    # repack specific layers
-    python repack_experts.py --dry-run           # verify without writing
-    python repack_experts.py --verify-only 0     # verify layer 0 against originals
+    python repack_experts_35b.py                    # repack all 40 layers
+    python repack_experts_35b.py --layers 0-4       # repack layers 0-4
+    python repack_experts_35b.py --layers 0,5,10    # repack specific layers
+    python repack_experts_35b.py --dry-run           # verify without writing
+    python repack_experts_35b.py --verify-only 0     # verify layer 0 against originals
 """
 
 import argparse
@@ -24,23 +24,25 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
+# Component order and expected sizes for Qwen3.5-35B-A3B switch_mlp experts
 COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+    {"name": "gate_proj.weight", "offset": 0,       "size": 524288, "dtype": "U32",  "shape": [512, 256]},
+    {"name": "gate_proj.scales", "offset": 524288,  "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "gate_proj.biases", "offset": 557056,  "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+
+    {"name": "up_proj.weight",   "offset": 589824,  "size": 524288, "dtype": "U32",  "shape": [512, 256]},
+    {"name": "up_proj.scales",   "offset": 1114112, "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "up_proj.biases",   "offset": 1146880, "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+
+    {"name": "down_proj.weight", "offset": 1179648, "size": 524288, "dtype": "U32",  "shape": [2048, 64]},
+    {"name": "down_proj.scales", "offset": 1703936, "size": 32768,  "dtype": "BF16", "shape": [2048, 8]},
+    {"name": "down_proj.biases", "offset": 1736704, "size": 32768,  "dtype": "BF16", "shape": [2048, 8]},
 ]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+EXPERT_SIZE = 1769472
+NUM_EXPERTS = 256
+NUM_LAYERS = 40
+LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 452,984,832 bytes (~432 MB)
 
 
 def parse_layers(spec):
@@ -59,7 +61,7 @@ def parse_layers(spec):
 
 
 def load_index(index_path):
-    """Load expert_index.json and return expert_reads dict + model_path."""
+    """Load expert_index_35b.json and return expert_reads dict + model_path."""
     with open(index_path) as f:
         idx = json.load(f)
     return idx['expert_reads'], idx['model_path']
@@ -101,7 +103,7 @@ def open_source_files(expert_reads, model_path, layers):
 
 
 def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=False):
-    """Repack all 512 experts for one layer into a contiguous binary file.
+    """Repack all 256 experts for one layer into a contiguous binary file.
 
     Returns (bytes_written, elapsed_seconds).
     """
@@ -111,15 +113,27 @@ def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=F
         return 0, 0.0
 
     layer_info = expert_reads[layer_key]
+    missing = [comp['name'] for comp in COMPONENTS if comp['name'] not in layer_info]
+    if missing:
+        raise KeyError(f"Layer {layer_idx} is missing components in expert index: {missing}")
+
     out_path = os.path.join(output_dir, f"layer_{layer_idx:02d}.bin")
 
     if dry_run:
-        # Just verify we can compute all offsets
+        # Verify source offsets and expected per-expert sizes without writing
         for expert_idx in range(NUM_EXPERTS):
             for comp in COMPONENTS:
                 info = layer_info[comp['name']]
+                if info['expert_size'] != comp['size']:
+                    raise ValueError(
+                        f"Layer {layer_idx}, {comp['name']}: index expert_size {info['expert_size']} != expected {comp['size']}"
+                    )
                 src_offset = info['abs_offset'] + expert_idx * info['expert_stride']
                 dst_offset = expert_idx * EXPERT_SIZE + comp['offset']
+                if src_offset < 0 or dst_offset < 0:
+                    raise ValueError(
+                        f"Negative offset detected for layer {layer_idx}, expert {expert_idx}, component {comp['name']}"
+                    )
         print(f"  Layer {layer_idx:2d}: DRY RUN OK — would write {LAYER_SIZE:,} bytes to {out_path}")
         return LAYER_SIZE, 0.0
 
@@ -164,6 +178,11 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     """Read back expert 0 from packed file and compare to originals."""
     layer_key = str(layer_idx)
     layer_info = expert_reads[layer_key]
+    missing = [comp['name'] for comp in COMPONENTS if comp['name'] not in layer_info]
+    if missing:
+        print(f"  Layer {layer_idx}: verification skipped, missing components: {missing}")
+        return False
+
     out_path = os.path.join(output_dir, f"layer_{layer_idx:02d}.bin")
 
     if not os.path.exists(out_path):
@@ -173,7 +192,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     fd_packed = os.open(out_path, os.O_RDONLY)
 
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    for expert_idx in [0, 1, 127, 255]:  # spot check several experts
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -190,7 +209,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     os.close(fd_packed)
 
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 127, 255)")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
@@ -213,8 +232,8 @@ def write_layout(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
-                        help='Path to expert_index.json')
+    parser.add_argument('--index', default='expert_index_35b.json',
+                        help='Path to expert_index_35b.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
     parser.add_argument('--dry-run', action='store_true',
@@ -243,6 +262,10 @@ def main():
     else:
         layers = parse_layers(args.layers)
 
+    if not layers:
+        print("No layers selected")
+        sys.exit(1)
+
     print(f"Layers to process: {layers[0]}-{layers[-1]} ({len(layers)} layers)")
 
     if not args.dry_run and args.verify_only is None:
@@ -257,7 +280,9 @@ def main():
         print(f"Free disk space: {free_gb:.1f} GB, needed: {needed_gb:.1f} GB")
         if free_bytes < total_bytes:
             print(f"WARNING: Not enough free space! Need {needed_gb:.1f} GB but only {free_gb:.1f} GB free.")
-            print(f"Hint: use --layers to process a subset, e.g. --layers 0-{int(free_gb / 3.63) - 1}")
+            approx_layer_gb = LAYER_SIZE / (1024**3)
+            max_layers_fit = max(0, int(free_gb / approx_layer_gb) - 1)
+            print(f"Hint: use --layers to process a subset, e.g. --layers 0-{max_layers_fit}")
             sys.exit(1)
 
     # Open source files
@@ -306,7 +331,7 @@ def main():
     # Final summary
     total_elapsed = time.monotonic() - t_start
     if not args.dry_run and total_written > 0:
-        print(f"\n{'='*60}")
+        print(f"\n{'='*40}")
         print(f"DONE: {total_written:,} bytes ({total_written/1024**3:.1f} GB) written")
         print(f"Time: {total_elapsed:.1f}s")
         print(f"Throughput: {total_written/total_elapsed/1024**3:.1f} GB/s")

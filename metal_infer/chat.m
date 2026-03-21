@@ -83,6 +83,98 @@ static void session_save_turn(const char *session_id, const char *role, const ch
     fclose(f);
 }
 
+// Build OpenAI-style messages JSON from the saved session file.
+// Returns number of bytes written to buf.
+static int session_build_messages_json(const char *session_id, char *buf, size_t bufsize) {
+    char path[1024];
+    session_path(session_id, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+
+    int n = 0;
+    if (bufsize < 3) return 0;
+    buf[n++] = '[';
+
+    if (!f) {
+        buf[n++] = ']';
+        buf[n] = 0;
+        return n;
+    }
+
+    char *line = malloc(MAX_RESPONSE);
+    if (!line) { fclose(f); buf[0] = '['; buf[1] = ']'; buf[2] = 0; return 2; }
+    char *content = malloc(MAX_RESPONSE);
+    char *escaped = malloc(MAX_RESPONSE * 2);
+    if (!content || !escaped) {
+        free(line);
+        if (content) free(content);
+        if (escaped) free(escaped);
+        fclose(f);
+        buf[0] = '['; buf[1] = ']'; buf[2] = 0;
+        return 2;
+    }
+
+    int first = 1;
+    while (fgets(line, MAX_RESPONSE, f)) {
+        char *role_start = strstr(line, "\"role\":\"");
+        char *content_start = strstr(line, "\"content\":\"");
+        if (!role_start || !content_start) continue;
+
+        role_start += 8;
+        char role[32]; int ri = 0;
+        while (*role_start && *role_start != '"' && ri < 31) role[ri++] = *role_start++;
+        role[ri] = 0;
+
+        content_start += 11;
+        int ci = 0;
+        for (int i = 0; content_start[i] && ci < MAX_RESPONSE - 1; i++) {
+            if (content_start[i] == '"' && (i == 0 || content_start[i-1] != '\\')) break;
+            if (content_start[i] == '\\' && content_start[i+1]) {
+                i++;
+                switch (content_start[i]) {
+                    case 'n': content[ci++] = '\n'; break;
+                    case 'r': content[ci++] = '\r'; break;
+                    case 't': content[ci++] = '\t'; break;
+                    case '"': content[ci++] = '"'; break;
+                    case '\\': content[ci++] = '\\'; break;
+                    default: content[ci++] = content_start[i]; break;
+                }
+            } else {
+                content[ci++] = content_start[i];
+            }
+        }
+        content[ci] = 0;
+
+        json_escape(content, escaped, MAX_RESPONSE * 2);
+
+        int wrote = snprintf(buf + n, bufsize - n,
+                             "%s{\"role\":\"%s\",\"content\":\"%s\"}",
+                             first ? "" : ",", role, escaped);
+        if (wrote < 0 || (size_t)wrote >= bufsize - n) {
+            fclose(f);
+            free(line);
+            free(content);
+            free(escaped);
+            if (n < (int)bufsize - 1) {
+                buf[n++] = ']';
+                buf[n] = 0;
+            }
+            return n;
+        }
+        n += wrote;
+        first = 0;
+    }
+    fclose(f);
+    free(line);
+    free(content);
+    free(escaped);
+
+    if (n < (int)bufsize - 1) {
+        buf[n++] = ']';
+        buf[n] = 0;
+    }
+    return n;
+}
+
 // Load session history and replay to screen
 static int session_load(const char *session_id) {
     char path[1024];
@@ -199,17 +291,30 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
         return -1;
     }
 
-    char escaped[MAX_INPUT_LINE * 2];
-    json_escape(user_message, escaped, sizeof(escaped));
+    char *messages_json = malloc(MAX_RESPONSE * 2);
+    char *body = malloc(MAX_RESPONSE * 2);
+    char *request = malloc(MAX_RESPONSE * 2);
+    if (!messages_json || !body || !request) {
+        fprintf(stderr, "\n[error] Out of memory building request.\n");
+        if (messages_json) free(messages_json);
+        if (body) free(body);
+        if (request) free(request);
+        close(sock);
+        return -1;
+    }
+    int messages_len = session_build_messages_json(session_id, messages_json, MAX_RESPONSE * 2);
+    if (messages_len <= 2) {
+        char escaped[MAX_INPUT_LINE * 2];
+        json_escape(user_message, escaped, sizeof(escaped));
+        messages_len = snprintf(messages_json, MAX_RESPONSE * 2,
+            "[{\"role\":\"user\",\"content\":\"%s\"}]", escaped);
+    }
 
-    char body[MAX_INPUT_LINE * 3];
-    int body_len = snprintf(body, sizeof(body),
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
-        "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
-        escaped, max_tokens, session_id);
+    int body_len = snprintf(body, MAX_RESPONSE * 2,
+        "{\"messages\":%s,\"max_tokens\":%d,\"stream\":true}",
+        messages_json, max_tokens);
 
-    char request[MAX_INPUT_LINE * 4];
-    int req_len = snprintf(request, sizeof(request),
+    int req_len = snprintf(request, MAX_RESPONSE * 2,
         "POST /v1/chat/completions HTTP/1.1\r\n"
         "Host: localhost:%d\r\n"
         "Content-Type: application/json\r\n"
@@ -220,6 +325,9 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
         port, body_len, body);
 
     write(sock, request, req_len);
+    free(messages_json);
+    free(body);
+    free(request);
     return sock;
 }
 
@@ -476,10 +584,11 @@ static char *stream_response(int sock, int show_thinking) {
     double gen_time = t_first > 0 ? now_ms() - t_first : 0;
     int gen_tokens = tokens > 1 ? tokens - 1 : 0;
     printf("\n\n");
-    if (gen_tokens > 0 && gen_time > 0)
+    if (gen_tokens > 0 && gen_time > 0) {
+        double ttft = t_first > 0 ? (t_first - t_start) / 1000.0 : 0.0;
         printf("[%d tokens, %.1f tok/s, TTFT %.1fs]\n\n",
-               tokens, gen_tokens * 1000.0 / gen_time,
-               t_first > 0 ? (t_first - now_ms() + gen_time + (t_first - (now_ms() - gen_time))) / 1000.0 : 0);
+               tokens, gen_tokens * 1000.0 / gen_time, ttft);
+    }
 
     return response;
 }
@@ -536,7 +645,7 @@ int main(int argc, char **argv) {
     }
 
     printf("==================================================\n");
-    printf("  Qwen3.5-397B-A17B Chat (Flash-MoE)\n");
+    printf("  Qwen3.5-35B-A3B Chat (Flash-MoE)\n");
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");
