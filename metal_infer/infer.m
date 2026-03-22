@@ -427,6 +427,7 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 static int g_serve_mode = 0;
+static uint64_t g_gpu_matvec_cpu_fallback_threshold = 0;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -1577,10 +1578,10 @@ static void gpu_dequant_matvec(
     const float *x_f32, float *out_f32,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
-    // For tiny matmuls, CPU wins because Metal dispatch + synchronization overhead
-    // is larger than the compute itself. This especially helps TTFT during prefill.
     uint64_t work_items = (uint64_t)out_dim * (uint64_t)in_dim;
-    if (work_items <= 262144ULL || !ctx->wf_buf) {
+    if (!ctx->wf_buf ||
+        (g_gpu_matvec_cpu_fallback_threshold > 0 &&
+         work_items <= g_gpu_matvec_cpu_fallback_threshold)) {
         cpu_dequant_matvec((const uint32_t *)W_packed,
                            (const uint16_t *)scales,
                            (const uint16_t *)biases,
@@ -1621,12 +1622,10 @@ static void gpu_dequant_matvec(
     [enc setBytes:&group_size     length:4     atIndex:7];
 
     if (use_lut) {
-        // v5: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        // fast: one threadgroup per output row, 64 threads per TG
         NSUInteger tg_size = 64;
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
@@ -1645,8 +1644,7 @@ static void gpu_dequant_matvec(
             (int)out_dim, (int)in_dim, (int)group_size);
         return;
     }
-    
-    // Copy result back
+
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
@@ -1656,8 +1654,7 @@ static void fast_dequant_matvec(
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    uint64_t work_items = (uint64_t)out_dim * (uint64_t)in_dim;
-    if (g_metal && g_metal->wf_buf && work_items > 262144ULL) {
+    if (g_metal && g_metal->wf_buf) {
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
@@ -7034,6 +7031,8 @@ int main(int argc, char **argv) {
         }
 
         g_serve_mode = (serve_port > 0);
+        g_gpu_matvec_cpu_fallback_threshold=0;
+        // g_gpu_matvec_cpu_fallback_threshold = g_serve_mode ? 32768 : 0;  
 
         // ---- Load model configuration from HF config.json ----
         load_model_config(model_path ? model_path : "");
@@ -7140,6 +7139,9 @@ int main(int argc, char **argv) {
         printf("K:        %d experts/layer\n", K);
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+        printf("Mode:     %s\n", g_serve_mode ? "serve" : "cli");
+        printf("Matvec:   GPU-first\n");
+        printf("\n");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
             printf("Cache:    malloc %d entries (%.1f GB)\n",
@@ -7343,15 +7345,19 @@ int main(int argc, char **argv) {
 
         // ---- Serve mode: enter HTTP server loop (never returns) ----
         if (serve_port > 0) {
+            g_serve_mode = 1;
             reset_delta_net_state();
             serve_loop(serve_port, wf, vocab,
                        layer_states, kv_caches,
                        (void **)layer_mmaps, layer_fds,
                        hidden, logits, final_norm_w, K);
             // serve_loop never returns, but cleanup just in case
-            free(hidden); free(logits);
+            free(hidden);
+            free(logits);
             return 0;
         }
+
+        g_serve_mode = 0;
 
         // ---- Generate tokens ----
         reset_delta_net_state();  // zero GPU delta-net state before generation
@@ -7392,7 +7398,7 @@ int main(int argc, char **argv) {
                 memcpy(hidden, embed_batch + (size_t)token_idx * cfg.hidden_dim,
                        cfg.hidden_dim * sizeof(float));
 
-                // Run through all 60 transformer layers
+                // Run through all transformer layers
                 for (int layer = 0; layer < cfg.num_layers; layer++) {
                     int is_full = cfg.is_full_attn[layer];
                     fused_layer_forward(wf, layer, hidden,
