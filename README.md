@@ -123,6 +123,8 @@ ls -lah metal_infer/tokenizer.bin metal_infer/vocab.bin
 cd /Users/sbaruwal/Repo/flash-moe-1/metal_infer
 
 clang -O2 -Wall -fobjc-arc   -framework Metal   -framework Foundation   -framework Accelerate   -lpthread   infer.m -o infer
+
+#### if xcode command line tools version is low, inset -lcompression option.
 ```
 
 ---
